@@ -12,15 +12,22 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 import json
 import pickle
+from pprint import pprint
 import sqlite3
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import aiohttp
+import dateutil.parser
 
 TRAVIS = "https://api.travis-ci.org"
 
 TRAVIS_CONFIG = os.path.expanduser('~/.travis/config.yml')
 
+def parse_date(ds):
+    if ds is None:
+        return
+    else:
+        return dateutil.parser.parse(ds)
 
 sqlite3.register_adapter(dict, json.dumps)
 sqlite3.register_converter('json', json.loads)
@@ -113,16 +120,32 @@ class DataStore():
                 number integer,
                 retrieved timestamp,
                 created_at timestamp,
-                started_at timestamp,
-                finished_at timestamp,
-                duration integer,
                 data json
+            )
+            """
+        )
+        self.db.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS jobs (
+                repo text,
+                build_number integer,
+                job_number integer,
+                retrieved timestamp,
+                created_at timestamp,
+                data json,
+                FOREIGN KEY(repo) REFERENCES builds(repo),
+                FOREIGN KEY(build_number) REFERENCES builds(number)
             )
             """
         )
         self.db.execute(
             """
             CREATE INDEX IF NOT EXISTS build_repo ON builds(repo)
+            """
+        )
+        self.db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS job_repo ON jobs(repo)
             """
         )
         self.db.commit()
@@ -138,38 +161,67 @@ class DataStore():
             (repo,)
         )]
 
+    def get_jobs(self, repo, build_number):
+        """Get all jobs for a given build"""
+        return [row[0] for row in self.db.execute(
+            f"""
+            SELECT data FROM jobs WHERE
+            repo = ? AND build_number = ?
+            ORDER BY job_number ASC
+            """,
+            (repo, build_number)
+        )]
+
     def save_build(self, build):
         repo = build['repository']['slug']
         now = datetime.utcnow()
-        data = json.dumps(build)
         number = int(build['number'])
 
         self.db.execute(
             f"""
             INSERT INTO builds
-            (repo, number, retrieved, created_at, started_at,
-            finished_at, duration, data)
+            (repo, number, retrieved, created_at, data)
             VALUES
-            (?   , ?     , ?        , ?         , ?         ,
-            ?          , ?       , ?   )
+            (?   , ?     , ?        , ?         , ?   )
             """,
             (
                 repo,
                 number,
                 now,
                 build['commit']['committed_at'],
-                build['started_at'],
-                build['finished_at'],
-                build['duration'],
                 build,
             ),
         )
         self.db.commit()
 
+    def save_job(self, job):
+        repo = job['repository']['slug']
+        now = datetime.utcnow()
+        build_number, job_number = [ int(s) for s in job['number'].split('.') ]
+        self.db.execute(
+            f"""
+            INSERT INTO jobs
+            (repo, build_number, job_number, retrieved, created_at, data)
+            VALUES
+            (?   , ?           , ?         , ?        , ?         , ?   )
+            """,
+            (
+                repo,
+                build_number,
+                job_number,
+                now,
+                job['created_at'],
+                job,
+            )
+        )
+        self.db.commit()
+
+
 class Travis:
     def __init__(self, token=None, cache_file='travis.sqlite',
                  cache_age=3600, concurrency=20, debug=True):
         self.debug = debug
+        self.skip_pages = False
         if token is None and os.getenv('TRAVIS_TOKEN'):
             token = os.getenv('TRAVIS_TOKEN')
         if token is None and os.path.exists(TRAVIS_CONFIG):
@@ -234,6 +286,9 @@ class Travis:
             if etag:
                 headers['If-Not-Modified'] = etag
         async with self.semaphore, aiohttp.ClientSession() as session:
+            if self.debug:
+                full_url = url + '?' + urlencode(params or {})
+                print(f"Fetching {full_url}")
             async with session.get(
                 url,
                 params=params,
@@ -286,7 +341,7 @@ class Travis:
         if self.debug:
             self._pagination_progress(pagination, key, who_for)
 
-        if pagination['is_last']:
+        if self.skip_pages or pagination['is_last']:
             # no more pages
             return
 
@@ -324,20 +379,21 @@ class Travis:
             repo_name = quote(repo, safe='')
             repo = await self.cached_get(f"{TRAVIS}/repo/{repo_name}")
         url = f"{TRAVIS}/repo/{repo['id']}/builds"
+        if self.debug:
+            print(f"Fetching builds for {repo['slug']}")
         async for build in self.paginated_get(url, params, repo['slug']):
             yield build
 
     async def jobs(self, build):
         """Get all jobs for a build"""
-        for job_info in build['jobs']:
-            job = await self.job(job_info)
+        futures = []
+        if self.debug:
+            print(f"Fetching jobs for {build['repository']['slug']}#{build['number']}")
+        who_for = f"{build['repository']['slug']}#{build['number']}"
+        url = f"{TRAVIS}/build/{build['id']}/jobs"
+        reply = await self.cached_get(url)
+        for job in reply['jobs']:
             yield job
-
-    async def job(self, job_info):
-        url = f"{TRAVIS}{job_info['@href']}"
-        job = await self.cached_get(url)
-        print(job['state'])
-        return job
 
     async def all_builds(self, owner, build_state=None):
         build_futures = []
@@ -347,20 +403,43 @@ class Travis:
             build_params['state'] = build_state
         # spawn generators in coroutines so they run concurrently
         # otherwise, lazy evaluation of generators will serialize everything
+        async def job_coro(build):
+            repo = build['repository']
+            n = int(build['number'])
+            cached_jobs = self.data_store.get_jobs(
+                repo['slug'], n)
+            cached_job_numbers = {job['number'] for job in cached_jobs}
+            if self.debug:
+                print(f"Cached {len(cached_jobs)}/{len(build['jobs'])} jobs for {repo['slug']}#{build['number']}")
+            if len(cached_jobs) == len(build['jobs']):
+                build['real_jobs'] = cached_jobs
+            else:
+                jobs = build['real_jobs'] = []
+                async for job in self.jobs(build):
+                    jobs.append(job)
+                    # save finished or canceled jobs in long-term storage
+                    if job['number'] not in cached_job_numbers:
+                        if (job['state'] in {'canceled', 'errored'} or job['finished_at']):
+                            self.data_store.save_job(job)
+                        elif job['state'] not in {'created'}:
+                            print("Not saving job")
+                            pprint(job)
 
         async def build_coro(repo):
             # if self.debug:
             #     print(f"Getting cached builds for {repo['slug']}")
             builds = []
             cached_builds = self.data_store.get_builds(repo['slug'])
-            # await self._in_thread(
-            #     lambda:
-            # )
+            cached_build_numbers = {build['number'] for build in cached_builds}
             seen = {0}
             offset = 0
+
+            job_futures = []
+
             for build in cached_builds:
                 # start offset with the last contiguous
                 n = int(build['number'])
+                job_futures.append(asyncio.ensure_future(job_coro(build)))
                 if n - 1 in seen:
                     # contiguous numbering
                     seen.add(n)
@@ -369,6 +448,9 @@ class Travis:
                         builds.append(build)
                 else:
                     break
+            # collect job futures partway through
+            await asyncio.gather(*job_futures)
+            job_futures = []
             params = {}
             params.update(build_params)
             # round offset to avoid cache busting
@@ -377,19 +459,29 @@ class Travis:
             # if self.debug:
             #     print(f"Fetching builds for {repo['slug']}[offset={offset}]")
 
+
             async for build in self.builds(repo, **params):
                 if int(build['number']) > offset:
                     builds.append(build)
+                    job_futures.append(asyncio.ensure_future(job_coro(build)))
                     # store finished builds in long-term storage
-                    if build['finished_at']:
-                        self.data_store.save_build(build)
-                    # if build['finished_at']:
-                    #     asyncio.ensure_future(self._in_thread(
-                    #         lambda:
-                    #     ))
+                    # some builds are known to be in a bad state,
+                    # so include stale/stuck builds in long-term storage
+                    if build['number'] not in cached_build_numbers:
+                        if (
+                            build['finished_at'] or
+                            parse_date(build['updated_at']) < \
+                            datetime.now().astimezone(timezone.utc) - timedelta(days=180)
+                        ):
+                            self.data_store.save_build(build)
+                        elif build['state'] not in {'created'}:
+                            print("Not saving build")
+                            pprint(build)
+
+            await asyncio.gather(*job_futures)
+
             # if self.debug:
             #     print(f"Found {len(builds)} builds for {repo['slug']}[offset={offset}]")
-            # self.data_store.db.commit()
             return builds
 
         async for repo in self.repos(owner):
