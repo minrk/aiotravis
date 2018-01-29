@@ -243,7 +243,7 @@ class Travis:
 
         # semaphore to limit concurrent requests
         self.semaphore = asyncio.Semaphore(concurrency)
-        self._session = None
+        self._sessions = {}
         self.cache_age = cache_age
         # separate http and data caches,
         # as expiry is different
@@ -251,7 +251,14 @@ class Travis:
         self.cache_thread = ThreadPoolExecutor(1)
         self._cache_file = cache_file
         self._init_caches()
-        # self.cache_thread.submit(self._init_caches).result()
+
+    @property
+    def session(self):
+        loop = asyncio.get_event_loop()
+        if loop not in self._sessions:
+            self._sessions[loop] = aiohttp.ClientSession()
+        return self._sessions[loop]
+
 
     def _init_caches(self):
         self.http_cache = Cache(self._cache_file, table='http')
@@ -285,11 +292,11 @@ class Travis:
             etag = cached['headers'].get('etag')
             if etag:
                 headers['If-Not-Modified'] = etag
-        async with self.semaphore, aiohttp.ClientSession() as session:
+        async with self.semaphore:
             if self.debug:
                 full_url = url + '?' + urlencode(params or {})
                 print(f"Fetching {full_url}")
-            async with session.get(
+            async with self.session.get(
                 url,
                 params=params,
                 headers=headers,
@@ -329,7 +336,6 @@ class Travis:
         """generator yielding paginated list from travis API"""
         if not params:
             params = {}
-        params.setdefault('limit', 100)
         # if self.debug:
         #     print('getting', url, params)
         data = await self.cached_get(url, params)
@@ -409,10 +415,10 @@ class Travis:
             cached_jobs = self.data_store.get_jobs(
                 repo['slug'], n)
             cached_job_numbers = {job['number'] for job in cached_jobs}
-            if self.debug:
-                print(f"Cached {len(cached_jobs)}/{len(build['jobs'])} jobs for {repo['slug']}#{build['number']}")
             if len(cached_jobs) == len(build['jobs']):
                 build['real_jobs'] = cached_jobs
+            elif len(cached_jobs) > len(build['jobs']):
+                raise ValueError(f"Too many jobs for {repo['slug']}#{build['number']}!")
             else:
                 jobs = build['real_jobs'] = []
                 async for job in self.jobs(build):
