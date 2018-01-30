@@ -490,6 +490,7 @@ class Travis:
         return {
             'repo': ProgressWidget('repos'),
             'build': ProgressWidget('builds'),
+
             'job': ProgressWidget('jobs'),
         }
 
@@ -634,4 +635,84 @@ class Travis:
             for f in done:
                 for build in await f:
                     yield build
+
+
+def load_builds(org, db_file='travis.sqlite'):
+    import pandas as pd
+    conn = sqlite3.connect('travis.sqlite')
+    all_builds = conn.execute(
+                """
+        SELECT data FROM builds
+        WHERE repo LIKE ?
+        ORDER BY created_at, repo
+        """,
+        (org + '/%',)
+    ).fetchall()
+    columns = [
+        'org',
+        'name',
+        'number',
+        'state',
+        'started',
+        'finished',
+        'created',
+        'duration',
+    ]
+    rows = []
+    for (build,) in all_builds:
+        build = json.loads(build)
+        org, name = build['repository']['slug'].split('/')
+        row = [
+            org,
+            name,
+            int(build['number']),
+            build['state'],
+            parse_date(build['started_at']),
+            parse_date(build['finished_at']),
+            parse_date(build['commit']['committed_at']),
+            build['duration'],
+        ]
+        rows.append(row)
+    return pd.DataFrame(rows, columns=columns)
+
+
+
+def load_jobs(org, db_file='travis.sqlite'):
+    import pandas as pd
+    conn = sqlite3.connect('travis.sqlite')
+    all_jobs = conn.execute(
+        """
+        SELECT data FROM jobs
+        WHERE repo LIKE ?
+        ORDER BY created_at, repo
+        """,
+        (org + '/%',)
+    ).fetchall()
+    columns = [
+        'org',
+        'name',
+        'build',
+        'number',
+        'state',
+        'started',
+        'finished',
+        'created',
+    ]
+    rows = []
+    for (job,) in all_jobs:
+        job = json.loads(job)
+        org, name = job['repository']['slug'].split('/')
+        build, number = (int(part) for part in job['number'].split('.'))
+        row = [
+            org,
+            name,
+            build,
+            number,
+            job['state'],
+            parse_date(job['started_at']),
+            parse_date(job['finished_at']),
+            parse_date(job['created_at']),
+        ]
+        rows.append(row)
+    return pd.DataFrame(rows, columns=columns)
 
