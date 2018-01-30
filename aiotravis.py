@@ -11,9 +11,9 @@ import asyncio
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 import json
-import pickle
 from pprint import pprint
 import sqlite3
+import time
 from urllib.parse import quote, urlencode
 
 import aiohttp
@@ -108,7 +108,9 @@ class DataStore():
 
     Store completed builds and jobs here
     """
-    def __init__(self, path=':memory:'):
+    def __init__(self, path=':memory:', commit_interval=100):
+        self.commit_interval = commit_interval
+        self._saves = 0
         self.db = sqlite3.connect(
             path,
             detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
@@ -120,7 +122,9 @@ class DataStore():
                 number integer,
                 retrieved timestamp,
                 created_at timestamp,
-                data json
+                data json,
+                PRIMARY KEY(repo, number)
+
             )
             """
         )
@@ -133,6 +137,7 @@ class DataStore():
                 retrieved timestamp,
                 created_at timestamp,
                 data json,
+                PRIMARY KEY(repo, build_number, job_number),
                 FOREIGN KEY(repo) REFERENCES builds(repo),
                 FOREIGN KEY(build_number) REFERENCES builds(number)
             )
@@ -172,14 +177,14 @@ class DataStore():
             (repo, build_number)
         )]
 
-    def save_build(self, build):
+    def save_build(self, build, commit=True):
         repo = build['repository']['slug']
         now = datetime.utcnow()
         number = int(build['number'])
 
         self.db.execute(
             f"""
-            INSERT INTO builds
+            INSERT OR REPLACE INTO builds
             (repo, number, retrieved, created_at, data)
             VALUES
             (?   , ?     , ?        , ?         , ?   )
@@ -192,15 +197,16 @@ class DataStore():
                 build,
             ),
         )
-        self.db.commit()
+        if commit:
+            self.db.commit()
 
-    def save_job(self, job):
+    def save_job(self, job, commit=True):
         repo = job['repository']['slug']
         now = datetime.utcnow()
         build_number, job_number = [ int(s) for s in job['number'].split('.') ]
         self.db.execute(
             f"""
-            INSERT INTO jobs
+            INSERT OR REPLACE INTO jobs
             (repo, build_number, job_number, retrieved, created_at, data)
             VALUES
             (?   , ?           , ?         , ?        , ?         , ?   )
@@ -214,7 +220,43 @@ class DataStore():
                 job,
             )
         )
-        self.db.commit()
+        if commit:
+            self.db.commit()
+
+    def all_builds(self, org):
+        """Retrieve all builds for a given org
+
+        As a single query
+        Builds will be ordered by build number
+        """
+        builds = defaultdict(list)
+        for repo, build in self.db.execute(
+            """
+            SELECT repo, data FROM builds
+            WHERE repo LIKE ?
+            ORDER BY number ASC
+            """, (org + '/%',)
+        ):
+            builds[repo].append(build)
+        return builds
+
+    def all_jobs(self, org):
+        """Retrieve all job for a given org
+
+        As a single query, so that cache doesn't need to be hit many times.
+        Jobs will be ordered by job number
+        """
+        jobs = defaultdict(lambda : defaultdict(list))
+        for repo, build_number, job in self.db.execute(
+            """
+            SELECT repo, build_number, data FROM jobs
+            WHERE repo LIKE ?
+            ORDER BY build_number, job_number ASC
+            """, (org + '/%',)
+        ):
+            jobs[repo][build_number].append(job)
+        return jobs
+
 
 
 class Travis:
@@ -242,6 +284,7 @@ class Travis:
         }
 
         # semaphore to limit concurrent requests
+        self.concurrency = concurrency
         self.semaphore = asyncio.Semaphore(concurrency)
         self._sessions = {}
         self.cache_age = cache_age
@@ -249,36 +292,28 @@ class Travis:
         # as expiry is different
         # run all caches in a background thread since they talk to sqlite
         self.cache_thread = ThreadPoolExecutor(1)
-        self._cache_file = cache_file
-        self._init_caches()
-
-    @property
-    def session(self):
-        loop = asyncio.get_event_loop()
-        if loop not in self._sessions:
-            self._sessions[loop] = aiohttp.ClientSession()
-        return self._sessions[loop]
-
-
-    def _init_caches(self):
-        self.http_cache = Cache(self._cache_file, table='http')
+        if cache_file != ':memory:':
+            basename = os.path.basename(cache_file)
+            base, ext = os.path.splitext(basename)
+            http_cache = basename + '.http' + ext
+        else:
+            http_cache = cache_file
+        self.http_cache = Cache(http_cache, table='http')
         # self.http_cache.cull(cache_age)
         # long-term storage for things that shouldn't expire
         # e.g. finished builds
-        self.data_store = DataStore(self._cache_file)
-
-    def _in_thread(self, work):
-        return asyncio.get_event_loop().run_in_executor(
-            self.cache_thread,
-            work,
-    )
+        self.data_store = DataStore(cache_file)
 
     async def cached_get(self, url, params=None):
         cache_key = url
+        full_url = url
         if params:
             # deterministic params in cache key
             # don't care if it's valid, so long as it's consistent
+            # don't trust urlencode to preserve order
             cache_key += '?' + json.dumps(params, sort_keys=True)
+        if params:
+            full_url = url + '?' + urlencode(params)
 
         cached, cache_date = self.http_cache.get(cache_key)
         if cached and cache_date >= age_cutoff(self.cache_age):
@@ -293,15 +328,22 @@ class Travis:
             if etag:
                 headers['If-Not-Modified'] = etag
         async with self.semaphore:
-            if self.debug:
-                full_url = url + '?' + urlencode(params or {})
+            if not hasattr(self, 'session'):
+                self.session = aiohttp.ClientSession()
+            session = self.session
+            if True or self.debug:
                 print(f"Fetching {full_url}")
-            async with self.session.get(
+            async with session.get(
                 url,
                 params=params,
                 headers=headers,
             ) as r:
-                data = await r.json()
+                try:
+                    data = await r.json()
+                except Exception:
+                    text = await r.text()
+                    print(f"Failed to get JSON: {text}")
+                    raise
                 if r.status == 200:
                     # make headers pickleable and case-insensitive (lowercase)
                     headers = {
@@ -319,9 +361,6 @@ class Travis:
                 else:
                     raise ValueError(f"Unexpected response status: {r.status}")
         self.http_cache.set(cache_key, cached)
-        # asyncio.ensure_future(self._in_thread(
-        #     lambda: self.http_cache.set(cache_key, cached)
-        # ))
         return cached['body']
 
     def _pagination_progress(self, pagination, key, who_for):
@@ -412,8 +451,9 @@ class Travis:
         async def job_coro(build):
             repo = build['repository']
             n = int(build['number'])
-            cached_jobs = self.data_store.get_jobs(
-                repo['slug'], n)
+            cached_jobs = cache['jobs'][repo['slug']][n]
+            # self.data_store.get_jobs(
+            #     repo['slug'], n)
             cached_job_numbers = {job['number'] for job in cached_jobs}
             if len(cached_jobs) == len(build['jobs']):
                 build['real_jobs'] = cached_jobs
@@ -426,26 +466,35 @@ class Travis:
                     # save finished or canceled jobs in long-term storage
                     if job['number'] not in cached_job_numbers:
                         if (job['state'] in {'canceled', 'errored'} or job['finished_at']):
-                            self.data_store.save_job(job)
-                        elif job['state'] not in {'created'}:
-                            print("Not saving job")
+                            self.data_store.save_job(job, commit=True)
+                        elif job['state'] not in {'created', 'started', 'pending'}:
+                            print(f"Not saving {job['state']} job")
                             pprint(job)
 
         async def build_coro(repo):
             # if self.debug:
             #     print(f"Getting cached builds for {repo['slug']}")
             builds = []
-            cached_builds = self.data_store.get_builds(repo['slug'])
+            cached_builds = cache['builds'][repo['slug']]
+            # self.data_store.get_builds(repo['slug'])
+            # cached_builds = []
             cached_build_numbers = {build['number'] for build in cached_builds}
             seen = {0}
             offset = 0
-
             job_futures = []
+
+            async def add_job_future(build):
+                if len(job_futures) >= self.concurrency:
+                    await asyncio.gather(*job_futures)
+                    job_futures[:] = []
+                f = asyncio.ensure_future(job_coro(build))
+                f.add_done_callback(lambda f: _inc_value('build'))
+                job_futures.append(f)
 
             for build in cached_builds:
                 # start offset with the last contiguous
                 n = int(build['number'])
-                job_futures.append(asyncio.ensure_future(job_coro(build)))
+                await add_job_future(build)
                 if n - 1 in seen:
                     # contiguous numbering
                     seen.add(n)
@@ -454,9 +503,6 @@ class Travis:
                         builds.append(build)
                 else:
                     break
-            # collect job futures partway through
-            await asyncio.gather(*job_futures)
-            job_futures = []
             params = {}
             params.update(build_params)
             # round offset to avoid cache busting
@@ -469,7 +515,7 @@ class Travis:
             async for build in self.builds(repo, **params):
                 if int(build['number']) > offset:
                     builds.append(build)
-                    job_futures.append(asyncio.ensure_future(job_coro(build)))
+                    await add_job_future(build)
                     # store finished builds in long-term storage
                     # some builds are known to be in a bad state,
                     # so include stale/stuck builds in long-term storage
@@ -479,15 +525,15 @@ class Travis:
                             parse_date(build['updated_at']) < \
                             datetime.now().astimezone(timezone.utc) - timedelta(days=180)
                         ):
-                            self.data_store.save_build(build)
-                        elif build['state'] not in {'created'}:
+                            self.data_store.save_build(build, commit=True)
+                        elif build['state'] not in {'created', 'started'}:
                             print("Not saving build")
                             pprint(build)
-
-            await asyncio.gather(*job_futures)
-
+            if job_futures:
+                await asyncio.gather(*job_futures)
             # if self.debug:
             #     print(f"Found {len(builds)} builds for {repo['slug']}[offset={offset}]")
+            self.data_store.db.commit()
             return builds
 
         async for repo in self.repos(owner):
