@@ -258,6 +258,51 @@ class DataStore():
         return jobs
 
 
+class ProgressWidget():
+    """Rate-limited progress widget
+
+    avoids flood of messages since events happen quickly
+    """
+    def __init__(self, desc, interval=.01):
+        from IPython.display import display
+        from ipywidgets import HBox, IntProgress, HTML
+        self._total = 0
+        self.value = 0
+        self._last_update = 0
+        self.interval = interval
+        prog = self.progress = IntProgress(description=desc, value=0, max=0)
+        text = HTML()
+        def _update_text(change):
+            text.value = f"{prog.value}/{prog.max}"
+        _update_text(None)
+        prog.observe(_update_text, names=['value', 'max'])
+        display(HBox([prog, text]))
+
+    def update(self, n=1):
+        self.value += n
+        self._maybe_update()
+
+    @property
+    def total(self):
+        return self._total
+
+    @total.setter
+    def total(self, value):
+        self._total = value
+        self._maybe_update()
+
+    def _maybe_update(self):
+        if self._total == self.progress.max and self.value == self.progress.value:
+            return
+        now = time.monotonic()
+        if (now - self._last_update) >= self.interval:
+            self._last_update = now
+            self._update()
+
+    def _update(self):
+        self.progress.value = self.value
+        self.progress.max = self._total
+
 
 class Travis:
     def __init__(self, token=None, cache_file='travis.sqlite',
@@ -440,12 +485,48 @@ class Travis:
         for job in reply['jobs']:
             yield job
 
-    async def all_builds(self, owner, build_state=None):
+    def progress_widgets(self):
+        """show progress with IPython widgets"""
+        return {
+            'repo': ProgressWidget('repos'),
+            'build': ProgressWidget('builds'),
+            'job': ProgressWidget('jobs'),
+        }
+
+    def progress_tqdm(self):
+        import tqdm
+        def progress(name):
+            return tqdm.tqdm_notebook(desc=name, unit='')
+        return {
+            'repo': progress('repos'),
+            'build': progress('builds'),
+            'job': progress('jobs'),
+        }
+
+    async def all_builds(self, owner, build_state=None, progress=True):
+        cache = {
+            'builds': self.data_store.all_builds(owner),
+            'jobs':  self.data_store.all_jobs(owner),
+        }
+        if progress:
+            progress = self.progress_widgets()
+
+        def _inc_total(key, by=1):
+            if not progress:
+                return
+            progress[key].total += by
+
+        def _inc_value(key, by=1):
+            if not progress:
+                return
+            progress[key].update(by)
+
         build_futures = []
         # iterate through repos and submit requests for builds
         build_params = {'sort_by': 'id'}
         if build_state:
             build_params['state'] = build_state
+
         # spawn generators in coroutines so they run concurrently
         # otherwise, lazy evaluation of generators will serialize everything
         async def job_coro(build):
@@ -455,8 +536,10 @@ class Travis:
             # self.data_store.get_jobs(
             #     repo['slug'], n)
             cached_job_numbers = {job['number'] for job in cached_jobs}
+            _inc_total('job', len(build['jobs']))
             if len(cached_jobs) == len(build['jobs']):
                 build['real_jobs'] = cached_jobs
+                _inc_value('job', len(cached_jobs))
             elif len(cached_jobs) > len(build['jobs']):
                 raise ValueError(f"Too many jobs for {repo['slug']}#{build['number']}!")
             else:
@@ -470,6 +553,7 @@ class Travis:
                         elif job['state'] not in {'created', 'started', 'pending'}:
                             print(f"Not saving {job['state']} job")
                             pprint(job)
+                    _inc_value('job')
 
         async def build_coro(repo):
             # if self.debug:
@@ -490,6 +574,8 @@ class Travis:
                 f = asyncio.ensure_future(job_coro(build))
                 f.add_done_callback(lambda f: _inc_value('build'))
                 job_futures.append(f)
+
+            _inc_total('build', len(cached_builds))
 
             for build in cached_builds:
                 # start offset with the last contiguous
@@ -520,6 +606,7 @@ class Travis:
                     # some builds are known to be in a bad state,
                     # so include stale/stuck builds in long-term storage
                     if build['number'] not in cached_build_numbers:
+                        _inc_total('build')
                         if (
                             build['finished_at'] or
                             parse_date(build['updated_at']) < \
@@ -537,9 +624,14 @@ class Travis:
             return builds
 
         async for repo in self.repos(owner):
+            _inc_total('repo')
             if repo['active']:
                 build_futures.append(asyncio.ensure_future(build_coro(repo)))
         # after submitting all requests, start yielding builds
-        for f in build_futures:
-            for build in await f:
-                yield build
+        while build_futures:
+            done, build_futures = await asyncio.wait(build_futures, return_when=asyncio.FIRST_COMPLETED)
+            _inc_value('repo', len(done))
+            for f in done:
+                for build in await f:
+                    yield build
+
